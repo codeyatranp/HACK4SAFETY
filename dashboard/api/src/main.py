@@ -144,6 +144,42 @@ async def _sync_external_sources_loop():
         await asyncio.sleep(60)
 
 
+def _source_health() -> dict[str, str]:
+    """
+    Lightweight health status derived from cached table freshness.
+    """
+    try:
+        dhm_fresh = not _is_stale(
+            _get_table_last_fetched_at("dhm_station_readings"),
+            timedelta(minutes=DHM_SYNC_MINUTES),
+        )
+    except Exception:
+        dhm_fresh = False
+
+    try:
+        bipad_alerts_fresh = not _is_stale(
+            _get_table_last_fetched_at("bipad_alerts"),
+            timedelta(minutes=BIPAD_ALERT_SYNC_MINUTES),
+        )
+    except Exception:
+        bipad_alerts_fresh = False
+
+    try:
+        bipad_incidents_fresh = not _is_stale(
+            _get_table_last_fetched_at("bipad_incidents"),
+            timedelta(hours=BIPAD_INCIDENT_SYNC_HOURS),
+        )
+    except Exception:
+        bipad_incidents_fresh = False
+
+    bipad_fresh = bipad_alerts_fresh or bipad_incidents_fresh
+    return {
+        "dhm": "CONNECTED" if dhm_fresh else "DEGRADED",
+        "bipad": "CONNECTED" if bipad_fresh else "DEGRADED",
+        "live_monitoring": "ACTIVE" if (dhm_fresh or bipad_fresh) else "DEGRADED",
+    }
+
+
 def on_mqtt_message(client, userdata, msg):
     """Forward MQTT messages to all connected WebSocket clients."""
     payload = msg.payload.decode("utf-8")
@@ -688,8 +724,9 @@ async def get_incident_timeline(limit: int = Query(default=20, ge=1, le=100)):
 
 @app.get("/api/command/system-status")
 async def get_system_status():
-    """Header status strip: health, sensors, BIPAD, monitoring."""
+    """Header status strip: health, sensors, DHM, BIPAD, monitoring."""
     conn = get_pg_conn()
+    source_health = _source_health()
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) as total FROM sensors")
         total_sensors = dict(cur.fetchone())["total"]
@@ -700,8 +737,9 @@ async def get_system_status():
         "sensors_online": f"{online_sensors} / {total_sensors}",
         "sensors_online_count": online_sensors,
         "sensors_total_count": total_sensors,
-        "bipad_link": "CONNECTED",
-        "live_monitoring": "ACTIVE",
+        "dhm_link": source_health["dhm"],
+        "bipad_link": source_health["bipad"],
+        "live_monitoring": source_health["live_monitoring"],
     }
 
 
@@ -709,6 +747,7 @@ async def get_system_status():
 async def get_modules_status():
     """Module connector ribbon: system module statuses."""
     conn = get_pg_conn()
+    source_health = _source_health()
     risk_engine_ts = None
     try:
         with conn.cursor() as cur:
@@ -743,8 +782,9 @@ async def get_modules_status():
             {"code": "MOD-01", "name": "Sensor Network", "value": f"{sensor_active} nodes", "status": "ok" if sensor_active > 0 else "warn"},
             {"code": "MOD-02", "name": "Risk Engine", "value": "v1.0 · SWI rule-based", "status": "ok" if risk_engine_ts else "warn"},
             {"code": "MOD-03", "name": "Alert System", "value": f"{alerts_dispatched} dispatched", "status": "warn" if alerts_dispatched > 5 else "ok"},
-            {"code": "MOD-04", "name": "BIPAD Integration", "value": "sync enabled", "status": "ok"},
-            {"code": "MOD-05", "name": "Police Route Optimizer", "value": "0 routes active", "status": "warn"},
+            {"code": "MOD-04", "name": "DHM Integration", "value": source_health["dhm"].lower(), "status": "ok" if source_health["dhm"] == "CONNECTED" else "warn"},
+            {"code": "MOD-05", "name": "BIPAD Integration", "value": source_health["bipad"].lower(), "status": "ok" if source_health["bipad"] == "CONNECTED" else "warn"},
+            {"code": "MOD-06", "name": "Police Route Optimizer", "value": "0 routes active", "status": "warn"},
         ]
     }
 
@@ -943,6 +983,12 @@ async def get_landslide_catalog(
                         d[k] = v.isoformat()
                 events.append(d)
         
+        COOLR_SYNC_HOURS_VAL = int(os.getenv("COOLR_SYNC_HOURS", "24"))
+        data_is_stale = _is_stale(
+            _get_table_last_fetched_at("landslide_catalog", "imported_at"),
+            timedelta(hours=COOLR_SYNC_HOURS_VAL),
+        )
+        
         return {
             "events": events,
             "count": len(events),
@@ -950,7 +996,8 @@ async def get_landslide_catalog(
             "source": "NASA COOLR Landslide Catalog",
             "bbox": bbox,
             "year_range": f"{year_from or 'all'}-{year_to or 'all'}",
-            "trigger": trigger or "all"
+            "trigger": trigger or "all",
+            "data_status": "stale" if data_is_stale else "fresh",
         }
     except Exception as e:
         logger.warning(f"Landslide catalog data fetch failed: {e}")
@@ -959,6 +1006,7 @@ async def get_landslide_catalog(
             "count": 0,
             "last_updated": datetime.now(timezone.utc).isoformat(),
             "source": "NASA COOLR Landslide Catalog (unavailable)",
+            "data_status": "unavailable",
             "error": str(e)
         }
 
@@ -1144,46 +1192,41 @@ async def get_source_status():
 
 @app.get("/api/command/satellite-feeds")
 async def get_satellite_feeds():
-    """Satellite feed sync status."""
+    """Satellite feed sync status derived from DB freshness."""
     conn = get_pg_conn()
     feeds = []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source, MAX(timestamp) as last_sync, is_stale
-                FROM satellite_data
-                GROUP BY source, is_stale
-                ORDER BY source
-            """)
-            for r in cur.fetchall():
-                d = dict(r)
-                delta = ""
-                if isinstance(d["last_sync"], datetime):
-                    diff = datetime.now(timezone.utc) - d["last_sync"]
-                    hrs, remainder = divmod(diff.seconds, 3600)
-                    mins, secs = divmod(remainder, 60)
-                    delta = f"-{hrs:02d}:{mins:02d}:{secs:02d}"
-                feeds.append({
-                    "source": _source_label(d["source"]),
-                    "delta": delta or "--:--:--",
-                    "ok": not d.get("is_stale", True),
-                })
-    except Exception:
-        # Fallback if no satellite_data entries exist
-        feeds = [
-            {"source": "NASA · MODIS Terra", "delta": "--:--:--", "ok": True},
-            {"source": "ESA · Sentinel-1 SAR", "delta": "--:--:--", "ok": True},
-            {"source": "ESA · Sentinel-2 MSI", "delta": "--:--:--", "ok": True},
-            {"source": "DHM · Rainfall Mesh", "delta": "--:--:--", "ok": True},
-        ]
 
-    # If table empty, provide defaults
+    source_freshness = [
+        ("nasa_gpm", "NASA GPM Rainfall", "dhm_station_readings", "fetched_at", DHM_SYNC_MINUTES * 2),
+        ("sentinel1", "ESA Sentinel-1 SAR", "satellite_data", "timestamp", 1440),
+        ("sentinel2", "ESA Sentinel-2 MSI", "satellite_data", "timestamp", 1440),
+        ("coolr", "NASA COOLR Landslide", "landslide_catalog", "imported_at", COOLR_SYNC_HOURS * 60),
+    ]
+
+    for src_key, label, table, col, max_age_mins in source_freshness:
+        try:
+            ts = _get_table_last_fetched_at(table, col)
+            if ts is None:
+                feeds.append({"source": label, "delta": "--:--:--", "ok": False})
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            diff = datetime.now(timezone.utc) - ts
+            total_secs = int(diff.total_seconds())
+            hrs, remainder = divmod(total_secs, 3600)
+            mins, secs = divmod(remainder, 60)
+            delta = f"-{hrs:02d}:{mins:02d}:{secs:02d}"
+            ok = total_secs <= max_age_mins * 60
+            feeds.append({"source": label, "delta": delta, "ok": ok})
+        except Exception:
+            feeds.append({"source": label, "delta": "--:--:--", "ok": False})
+
     if not feeds:
         feeds = [
-            {"source": "NASA · MODIS Terra", "delta": "--:--:--", "ok": True},
-            {"source": "ESA · Sentinel-1 SAR", "delta": "--:--:--", "ok": True},
-            {"source": "ESA · Sentinel-2 MSI", "delta": "--:--:--", "ok": True},
-            {"source": "DHM · Rainfall Mesh", "delta": "--:--:--", "ok": True},
+            {"source": "NASA GPM Rainfall", "delta": "--:--:--", "ok": True},
+            {"source": "ESA Sentinel-1 SAR", "delta": "--:--:--", "ok": True},
+            {"source": "ESA Sentinel-2 MSI", "delta": "--:--:--", "ok": True},
+            {"source": "NASA COOLR Landslide", "delta": "--:--:--", "ok": True},
         ]
 
     return {"feeds": feeds}
