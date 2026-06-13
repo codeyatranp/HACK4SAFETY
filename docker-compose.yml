@@ -165,6 +165,11 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   # ── GeoGuard Nepal Dashboard (TanStack Start) ────────────
@@ -175,9 +180,10 @@ services:
     ports:
       - "3002:3002"
     environment:
-      - VITE_API_BASE=http://localhost:8000
+      - DASHBOARD_API_INTERNAL_BASE=http://dashboard-api:8000
     depends_on:
-      - dashboard-api
+      dashboard-api:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

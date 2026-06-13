@@ -768,12 +768,15 @@ async def get_modules_status():
 
     sensor_total = 0
     sensor_active = 0
+    route_count = 0
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) as total FROM sensors")
             sensor_total = dict(cur.fetchone())["total"]
             cur.execute("SELECT COUNT(*) FILTER (WHERE status = 'active') as online FROM sensors")
             sensor_active = dict(cur.fetchone())["online"]
+            cur.execute("SELECT COUNT(*) as total FROM osm_roads WHERE risk_score > 0")
+            route_count = dict(cur.fetchone())["total"]
     except Exception:
         pass
 
@@ -784,7 +787,7 @@ async def get_modules_status():
             {"code": "MOD-03", "name": "Alert System", "value": f"{alerts_dispatched} dispatched", "status": "warn" if alerts_dispatched > 5 else "ok"},
             {"code": "MOD-04", "name": "DHM Integration", "value": source_health["dhm"].lower(), "status": "ok" if source_health["dhm"] == "CONNECTED" else "warn"},
             {"code": "MOD-05", "name": "BIPAD Integration", "value": source_health["bipad"].lower(), "status": "ok" if source_health["bipad"] == "CONNECTED" else "warn"},
-            {"code": "MOD-06", "name": "Police Route Optimizer", "value": "0 routes active", "status": "warn"},
+            {"code": "MOD-06", "name": "Police Route Optimizer", "value": f"{route_count} routes active", "status": "ok" if route_count > 0 else "warn"},
         ]
     }
 
@@ -1246,27 +1249,84 @@ def _source_label(source: str) -> str:
 
 @app.get("/api/command/forecast")
 async def get_forecast_24h():
-    """24-hour rainfall risk forecast bars + summary."""
+    """24-hour risk outlook derived from real risk history."""
     conn = get_pg_conn()
-    avg_risk = 0
+    bars: list[dict[str, Any]] = []
+    summary = "No recent risk history available."
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT AVG(risk_score) as avg FROM risk_scores_current WHERE risk_score IS NOT NULL")
-            row = cur.fetchone()
-            if row:
-                avg_risk = float(row["avg"] or 0)
-    except Exception:
-        pass
+            cur.execute("""
+                SELECT timestamp, risk_score, zone_id, risk_level
+                FROM risk_scores_history
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+                  AND risk_score IS NOT NULL
+                ORDER BY timestamp ASC
+            """)
+            rows = cur.fetchall()
 
-    # Generate forecast bars based on current average risk (monsoon ramp pattern)
-    base = avg_risk * 0.6
-    bars = []
-    for i in range(6):
-        offset = (i + 1) * 4
-        # Simulate monsoon ramp-up pattern
-        val = min(100, max(0, base + (i - 1) * 8 + (i % 3) * 5))
-        bars.append({"hour_offset": offset, "probability": round(val, 1)})
-    return {"forecast": bars, "summary": "Convective rainfall expected over Gandaki / Bagmati. Saturation thresholds likely breached in high-risk districts."}
+            if rows:
+                window_count = 6
+                window_hours = 24 / window_count
+                by_window: list[list[float]] = [[] for _ in range(window_count)]
+
+                for row in rows:
+                    ts = row["timestamp"]
+                    if ts is None:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                    window_index = min(window_count - 1, max(0, int(age_hours // window_hours)))
+                    by_window[window_index].append(float(row["risk_score"]))
+
+                for index, scores in enumerate(reversed(by_window)):
+                    probability = round(sum(scores) / len(scores), 1) if scores else 0.0
+                    bars.append({
+                        "hour_offset": int((index + 1) * window_hours),
+                        "probability": probability,
+                    })
+
+                cur.execute("""
+                    SELECT z.district, AVG(r.risk_score) AS avg_score
+                    FROM risk_scores_history r
+                    JOIN zones z ON z.zone_id = r.zone_id
+                    WHERE r.timestamp >= NOW() - INTERVAL '24 hours'
+                      AND r.risk_score IS NOT NULL
+                    GROUP BY z.district
+                    ORDER BY avg_score DESC
+                    LIMIT 1
+                """)
+                top_row = cur.fetchone()
+
+                cur.execute("""
+                    SELECT AVG(risk_score) AS avg_score
+                    FROM risk_scores_current
+                    WHERE risk_score IS NOT NULL
+                """)
+                current_row = cur.fetchone()
+                avg_current = float(current_row["avg_score"] or 0) if current_row else 0.0
+
+                if top_row and top_row["district"]:
+                    summary = (
+                        f"24h outlook is anchored in live risk history. "
+                        f"{top_row['district']} has the highest average risk over the last day."
+                    )
+                else:
+                    summary = f"24h outlook is anchored in live risk history. Current mean risk score is {avg_current:.1f}."
+            else:
+                cur.execute("""
+                    SELECT AVG(risk_score) AS avg_score
+                    FROM risk_scores_current
+                    WHERE risk_score IS NOT NULL
+                """)
+                row = cur.fetchone()
+                avg_score = float(row["avg_score"] or 0) if row else 0.0
+                bars = [{"hour_offset": (i + 1) * 4, "probability": round(avg_score, 1)} for i in range(6)]
+                summary = f"24h outlook mirrors the current live mean risk score of {avg_score:.1f}."
+    except Exception as e:
+        logger.warning(f"Forecast data fetch failed: {e}")
+
+    return {"forecast": bars, "summary": summary}
 
 
 @app.get("/api/command/risk-prediction")
@@ -1301,28 +1361,32 @@ async def get_risk_prediction():
 
 @app.get("/api/command/incident-counter")
 async def get_incident_counter():
-    """Live incident counter with hourly histogram."""
+    """Live incident counter with an actual 24-hour alert histogram."""
     conn = get_pg_conn()
     active = 0
+    histogram = [0 for _ in range(24)]
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) as cnt FROM alerts WHERE acknowledged = FALSE")
             active = dict(cur.fetchone())["cnt"]
-    except Exception:
-        pass
-
-    # Generate 24-bar histogram (simulated pattern based on alert count)
-    bars = []
-    for i in range(24):
-        # Morning hours lower, afternoon peak
-        base_h = 4 if i < 6 else (8 + i % 5) if i < 18 else 5
-        bars.append(min(28, max(3, base_h + (active // 10))))
+            cur.execute("""
+                SELECT
+                    EXTRACT(HOUR FROM timestamp AT TIME ZONE 'UTC')::int AS hour_bucket,
+                    COUNT(*) AS count
+                FROM alerts
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+                GROUP BY hour_bucket
+            """)
+            for row in cur.fetchall():
+                histogram[int(row["hour_bucket"]) % 24] = int(row["count"])
+    except Exception as e:
+        logger.warning(f"Incident counter fetch failed: {e}")
 
     return {
         "active_incidents": active,
-        "delta_24h": active > 5 if active else 0,
-        "delta_count": min(active, 18),
-        "hourly_histogram": bars,
+        "delta_24h": sum(histogram[-24:]),
+        "delta_count": histogram[-1] if histogram else 0,
+        "hourly_histogram": histogram,
     }
 
 
