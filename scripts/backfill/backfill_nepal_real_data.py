@@ -240,6 +240,22 @@ async def backfill_open_meteo(days: int) -> int:
     return written or 0
 
 
+def record_feed_sync(source: str, success: bool = True) -> None:
+    """Record a feed sync event in PostgreSQL for the dashboard status panel."""
+    try:
+        with pg_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO satellite_data (zone_id, source, timestamp, data_type, metadata)
+                VALUES ('SINDHUPALCHOK-05', %s, %s, 'sync_event', %s)
+                ON CONFLICT (zone_id, source, data_type, timestamp) DO UPDATE 
+                SET metadata = EXCLUDED.metadata
+                """,
+                (source, utc_now(), json.dumps({"status": "ok" if success else "failed"}))
+            )
+    except Exception as e:
+        logger.error(f"Failed to record feed sync for {source}: {e}")
+
 async def main() -> None:
     args = parse_args()
     if args.cleanup:
@@ -247,20 +263,28 @@ async def main() -> None:
         cleanup_influx()
 
     await run_dhm_if_real(args.days, args.allow_simulated)
-    
+
     logger.info("Starting Open-Meteo rainfall backfill...")
     om_rows = await backfill_open_meteo(args.days)
-    
+    record_feed_sync("open_meteo", success=(om_rows > 0))
+
+    # Fallbacks (Optional/Experimental)
     gpm_rows = 0
     chirps_rows = 0
     if not om_rows or args.allow_simulated:
         gpm_rows = await backfill_nasa_gpm(args.days, args.step_hours, args.allow_simulated)
-        chirps_rows = await backfill_nasa_chirps(args.days, args.allow_simulated)
+        if gpm_rows: record_feed_sync("nasa_gpm")
 
-    s1_zones, s2_zones = await backfill_sentinel_catalog(args.days)
+        chirps_rows = await backfill_nasa_chirps(args.days, args.allow_simulated)
+        if chirps_rows: record_feed_sync("nasa_chirps")
+
+    s1_count, s2_count = await backfill_sentinel_catalog(args.days)
+    if s1_count: record_feed_sync("sentinel1")
+    if s2_count: record_feed_sync("sentinel2")
 
     if args.include_osm:
         await run_osm()
+
 
     if not args.skip_risk:
         logger.info("Running one risk scoring cycle")
@@ -273,12 +297,12 @@ async def main() -> None:
             logger.warning("RiskEngine not found; skipping risk scoring cycle")
 
     logger.info(
-        "Backfill complete: open_meteo_rows=%s nasa_gpm_rows=%s nasa_chirps_rows=%s sentinel1_zones=%s sentinel2_zones=%s",
+        "Backfill complete: open_meteo_rows=%s nasa_gpm_rows=%s nasa_chirps_rows=%s sentinel1_count=%s sentinel2_count=%s",
         om_rows,
         gpm_rows,
         chirps_rows,
-        s1_zones,
-        s2_zones,
+        s1_count,
+        s2_count,
     )
 
 

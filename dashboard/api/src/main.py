@@ -663,45 +663,70 @@ async def get_modules_status():
 
 
 @app.get("/api/command/weather")
-async def get_weather():
-    """Weather intelligence panel data from sensor readings."""
+async def get_weather(
+    lat: float = Query(default=27.7172),
+    lng: float = Query(default=85.3240),
+    zone_id: Optional[str] = Query(default=None)
+):
+    """Weather intelligence panel data from real-time Open-Meteo and local sensor averages."""
     conn = get_pg_conn()
     rainfall_24h = "--"
     humidity = "--"
     temp = "--"
     wind = "--"
 
+    # Local averages or zone-specific data from risk engine results
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT AVG(rainfall_24hr_mm) as rain_24,
-                       AVG(soil_moisture_pct) as humidity
-                FROM risk_scores_current
-                WHERE rainfall_24hr_mm IS NOT NULL
-            """)
+            if zone_id:
+                cur.execute("""
+                    SELECT rainfall_24hr_mm as rain_24,
+                           soil_moisture_pct as humidity
+                    FROM risk_scores_current
+                    WHERE zone_id = %s
+                """, (zone_id,))
+            else:
+                cur.execute("""
+                    SELECT AVG(rainfall_24hr_mm) as rain_24,
+                           AVG(soil_moisture_pct) as humidity
+                    FROM risk_scores_current
+                    WHERE rainfall_24hr_mm IS NOT NULL
+                """)
             row = cur.fetchone()
-            if row and row["rain_24"]:
+            if row and row["rain_24"] is not None:
                 rainfall_24h = f"{row['rain_24']:.1f} mm"
-            if row and row["humidity"]:
+            if row and row["humidity"] is not None:
                 humidity = f"{row['humidity']:.0f} %"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Database weather query failed: {e}")
 
+    # Real-time weather for specified coordinates (default KTM)
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT AVG(rainfall_24hr_mm) as rain
-                FROM risk_scores_current
-                WHERE soil_moisture_pct IS NOT NULL AND rainfall_24hr_mm IS NOT NULL
-            """)
-    except Exception:
-        pass
+        import httpx
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m"
+        resp = httpx.get(url, timeout=3.0)
+        if resp.status_code == 200:
+            w = resp.json().get("current", {})
+            temp = f"{w.get('temperature_2m', '--')} °C"
+            wind_speed = w.get('wind_speed_10m', '--')
+            wind_dir = w.get('wind_direction_10m', 0)
+            
+            if wind_speed != '--':
+                dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                dir_str = dirs[int((float(wind_dir) + 22.5) / 45) % 8]
+                wind = f"{wind_speed} km/h {dir_str}"
+            
+            if humidity == "--" and w.get('relative_humidity_2m') is not None:
+                humidity = f"{w.get('relative_humidity_2m')} %"
+    except Exception as e:
+        logger.warning(f"Real-time weather fetch failed for {lat},{lng}: {e}")
 
     return {
         "rainfall_24h": rainfall_24h,
-        "wind": "14 km/h NE",
+        "wind": wind,
         "humidity": humidity,
-        "temperature_ktm": "21.4 °C",
+        "temperature_ktm": temp,  # Keeping key name for frontend compatibility, but value is local
+        "location": "Local" if zone_id else "Kathmandu"
     }
 
 
@@ -754,7 +779,9 @@ async def get_satellite_feeds():
 
 def _source_label(source: str) -> str:
     labels = {
-        "nasa_gpm": "NASA · MODIS Terra",
+        "nasa_gpm": "NASA · GPM Rainfall",
+        "nasa_chirps": "NASA · CHIRPS Rainfall",
+        "open_meteo": "Open-Meteo · Rainfall",
         "sentinel1": "ESA · Sentinel-1 SAR",
         "sentinel2": "ESA · Sentinel-2 MSI",
         "dhm": "DHM · Rainfall Mesh",
