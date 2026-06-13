@@ -1,0 +1,185 @@
+services:
+  # ── IoT Sensor API (Node.js) ──────────────────────────────
+  sensor-api:
+    build:
+      context: .
+      dockerfile: ./ingestion/api/Dockerfile
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - POSTGRES_URL=postgres:5432
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── DHM Rainfall Connector (Python) ───────────────────────
+  dhm-connector:
+    build:
+      context: .
+      dockerfile: ./ingestion/dhm/Dockerfile
+    env_file: .env
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - POSTGRES_URL=postgres:5432
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Satellite Data Fetcher (Python) ───────────────────────
+  satellite-fetcher:
+    build:
+      context: .
+      dockerfile: ./ingestion/satellite/Dockerfile
+    env_file: .env
+    network_mode: host
+    environment:
+      - INFLUXDB_URL=http://localhost:8086
+      - POSTGRES_HOST=localhost
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=geoguard
+      - POSTGRES_PASSWORD=geoguard_admin
+      - POSTGRES_DB=geoguard
+      - ZONES_CONFIG_PATH=/app/shared/config/nepal_zones.json
+    restart: unless-stopped
+
+  # ── InfluxDB (Time-Series) ────────────────────────────────
+  influxdb:
+    image: influxdb:2.7
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - ./scripts/setup-influx.sh:/docker-entrypoint-initdb.d/setup-influx.sh
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=geoguard
+      - DOCKER_INFLUXDB_INIT_PASSWORD=geoguard_admin
+      - DOCKER_INFLUXDB_INIT_ORG=geoguard
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensor-data
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=geoguard-influx-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── PostgreSQL + PostGIS (Spatial) ────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/setup-postgis.sql:/docker-entrypoint-initdb.d/setup-postgis.sql
+    environment:
+      - POSTGRES_USER=geoguard
+      - POSTGRES_PASSWORD=geoguard_admin
+      - POSTGRES_DB=geoguard
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geoguard -d geoguard"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Mosquitto MQTT Broker ─────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./ingestion/api/mqtt/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    restart: unless-stopped
+
+# ── Risk Score Engine (Python) ──────────────────────────────
+  risk-engine:
+    build:
+      context: .
+      dockerfile: ./processing/engine/Dockerfile
+    env_file: .env
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - POSTGRES_HOST=postgres
+      - MQTT_HOST=mosquitto
+      - PYTHONPATH=/app
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── GIS Zone Mapper (Python) ────────────────────────────────
+  gis-mapper:
+    build:
+      context: .
+      dockerfile: ./processing/gis/Dockerfile
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Threshold Detector (Node.js) ───────────────────────────
+  threshold-detector:
+    build:
+      context: .
+      dockerfile: ./processing/threshold_detector/Dockerfile
+    env_file: .env
+    environment:
+      - MQTT_HOST=mosquitto
+      - POSTGRES_HOST=postgres
+    depends_on:
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Dashboard API (Python/FastAPI) ───────────────────────
+  dashboard-api:
+    build:
+      context: .
+      dockerfile: ./dashboard/api/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - POSTGRES_HOST=postgres
+      - MQTT_HOST=mosquitto
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── GeoGuard Nepal Dashboard (TanStack Start) ────────────
+  geo-guard-nepal:
+    build:
+      context: ./dashboard/geo-guard-nepal
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3002"
+    environment:
+      - VITE_API_BASE=http://localhost:8000
+    depends_on:
+      - dashboard-api
+    restart: unless-stopped
+
+volumes:
+  influxdb-data:
+  postgres-data:

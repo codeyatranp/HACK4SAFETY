@@ -1,0 +1,19 @@
+{
+  "name": "geoguard-threshold-detector",
+  "version": "1.0.0",
+  "description": "GeoGuard Event Threshold Detector — real-time MQTT stream processor",
+  "main": "src/detector.js",
+  "scripts": {
+    "start": "node src/detector.js",
+    "dev": "nodemon src/detector.js"
+  },
+  "dependencies": {
+    "mqtt": "^5.3.0",
+    "pg": "^8.11.3",
+    "@influxdata/influxdb-client": "^1.33.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}

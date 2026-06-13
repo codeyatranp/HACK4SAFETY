@@ -1,0 +1,5 @@
+psycopg2-binary==2.9.9
+geopandas==0.14.2
+shapely==2.0.2
+pydantic==2.5.3
+python-dotenv==1.0.0

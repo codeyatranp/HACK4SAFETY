@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SensorDataPayload",
+  "description": "Schema for IoT sensor data pushed by hardware team. Supports: rain detection sensor, moisture sensor, wind speed sensor, tiltometer.",
+  "type": "object",
+  "required": ["sensor_id", "timestamp"],
+  "properties": {
+    "sensor_id": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 50,
+      "pattern": "^[A-Za-z0-9\\-]+$",
+      "description": "Unique identifier for the sensor node"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of the reading"
+    },
+    "rain_detected": {
+      "type": "boolean",
+      "description": "Rain detection sensor — true if rain is currently detected"
+    },
+    "rainfall_mm": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 500,
+      "description": "Rainfall accumulation in millimeters (from tipping bucket or gauge)"
+    },
+    "moisture_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Soil moisture percentage from moisture sensor"
+    },
+    "wind_speed_kmh": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 200,
+      "description": "Wind speed in km/h from wind speed detection sensor"
+    },
+    "tilt_deg": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 90,
+      "description": "Ground/slope tilt angle in degrees from tiltometer"
+    },
+    "vibration_g": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "Vibration measurement in G-force (accelerometer)"
+    },
+    "battery_pct": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Sensor node battery percentage"
+    },
+    "gps_lat": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90,
+      "description": "GPS latitude of sensor"
+    },
+    "gps_lng": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180,
+      "description": "GPS longitude of sensor"
+    }
+  },
+  "additionalProperties": false
+}
