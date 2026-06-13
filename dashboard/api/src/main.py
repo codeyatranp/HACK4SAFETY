@@ -7,7 +7,7 @@ Real-time updates pushed via MQTT WebSocket bridge.
 import os
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,7 @@ from influxdb_client.rest import ApiException
 import paho.mqtt.client as mqtt
 import json
 import asyncio
+from source_sync import ExternalSourceSync
 
 logger = logging.getLogger("dashboard-api")
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +82,66 @@ app.add_middleware(
 # ── MQTT → WebSocket bridge ──────────────────────────────────
 ws_clients: list[WebSocket] = []
 mqtt_client = None
+source_sync = ExternalSourceSync(get_pg_conn, logger=logger)
+external_sync_task: Optional[asyncio.Task] = None
+
+DHM_SYNC_MINUTES = int(os.getenv("DHM_SYNC_MINUTES", "30"))
+BIPAD_ALERT_SYNC_MINUTES = int(os.getenv("BIPAD_ALERT_SYNC_MINUTES", "15"))
+BIPAD_INCIDENT_SYNC_HOURS = int(os.getenv("BIPAD_INCIDENT_SYNC_HOURS", "6"))
+COOLR_SYNC_HOURS = int(os.getenv("COOLR_SYNC_HOURS", "24"))
+
+
+def _is_stale(last_seen: Optional[datetime], max_age: timedelta) -> bool:
+    if not last_seen:
+        return True
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - last_seen > max_age
+
+
+def _get_table_last_fetched_at(table_name: str, column_name: str = "fetched_at") -> Optional[datetime]:
+    conn = get_pg_conn()
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT MAX({column_name}) AS ts FROM {table_name}")
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row["ts"]
+
+
+async def _sync_external_sources_loop():
+    while True:
+        try:
+            dhm_last = _get_table_last_fetched_at("dhm_station_readings")
+            if _is_stale(dhm_last, timedelta(minutes=DHM_SYNC_MINUTES)):
+                try:
+                    await source_sync.sync_dhm()
+                except Exception as e:
+                    logger.warning(f"DHM scheduled sync failed: {e}")
+
+            alerts_last = _get_table_last_fetched_at("bipad_alerts")
+            if _is_stale(alerts_last, timedelta(minutes=BIPAD_ALERT_SYNC_MINUTES)):
+                try:
+                    await source_sync.sync_bipad_alerts()
+                except Exception as e:
+                    logger.warning(f"BIPAD alerts scheduled sync failed: {e}")
+
+            incidents_last = _get_table_last_fetched_at("bipad_incidents")
+            if _is_stale(incidents_last, timedelta(hours=BIPAD_INCIDENT_SYNC_HOURS)):
+                try:
+                    await source_sync.sync_bipad_incidents(days=30)
+                except Exception as e:
+                    logger.warning(f"BIPAD incidents scheduled sync failed: {e}")
+
+            coolr_last = _get_table_last_fetched_at("landslide_catalog", "imported_at")
+            if _is_stale(coolr_last, timedelta(hours=COOLR_SYNC_HOURS)):
+                try:
+                    await source_sync.sync_coolr()
+                except Exception as e:
+                    logger.warning(f"COOLR scheduled sync failed: {e}")
+        except Exception as e:
+            logger.warning(f"External sync loop iteration failed: {e}")
+        await asyncio.sleep(60)
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -115,10 +176,36 @@ def start_mqtt():
 @app.on_event("startup")
 async def startup():
     start_mqtt()
+    source_sync.ensure_schema()
+
+    try:
+        await source_sync.sync_dhm()
+    except Exception as e:
+        logger.warning(f"Initial DHM sync failed: {e}")
+
+    try:
+        await source_sync.sync_bipad_alerts()
+    except Exception as e:
+        logger.warning(f"Initial BIPAD alerts sync failed: {e}")
+
+    try:
+        await source_sync.sync_bipad_incidents(days=30)
+    except Exception as e:
+        logger.warning(f"Initial BIPAD incidents sync failed: {e}")
+
+    global external_sync_task
+    external_sync_task = asyncio.create_task(_sync_external_sources_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    global external_sync_task
+    if external_sync_task:
+        external_sync_task.cancel()
+        try:
+            await external_sync_task
+        except asyncio.CancelledError:
+            pass
     if mqtt_client:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
@@ -681,22 +768,30 @@ async def get_weather(
             if zone_id:
                 cur.execute("""
                     SELECT rainfall_24hr_mm as rain_24,
-                           soil_moisture_pct as humidity
+                           soil_moisture_pct as soil_moisture,
+                           AVG(rainfall_24hr_mm) as avg_rain,
+                           AVG(soil_moisture_pct) as avg_soil_moisture
                     FROM risk_scores_current
                     WHERE zone_id = %s
                 """, (zone_id,))
             else:
                 cur.execute("""
                     SELECT AVG(rainfall_24hr_mm) as rain_24,
-                           AVG(soil_moisture_pct) as humidity
+                           AVG(soil_moisture_pct) as soil_moisture,
+                           AVG(rainfall_24hr_mm) as avg_rain,
+                           AVG(soil_moisture_pct) as avg_soil_moisture
                     FROM risk_scores_current
                     WHERE rainfall_24hr_mm IS NOT NULL
                 """)
             row = cur.fetchone()
             if row and row["rain_24"] is not None:
                 rainfall_24h = f"{row['rain_24']:.1f} mm"
-            if row and row["humidity"] is not None:
-                humidity = f"{row['humidity']:.0f} %"
+            elif row and row["avg_rain"] is not None:
+                rainfall_24h = f"{row['avg_rain']:.1f} mm"
+            if row and row["soil_moisture"] is not None:
+                humidity = f"{row['soil_moisture']:.0f} %"
+            elif row and row["avg_soil_moisture"] is not None:
+                humidity = f"{row['avg_soil_moisture']:.0f} %"
     except Exception as e:
         logger.warning(f"Database weather query failed: {e}")
 
@@ -727,6 +822,323 @@ async def get_weather(
         "humidity": humidity,
         "temperature_ktm": temp,  # Keeping key name for frontend compatibility, but value is local
         "location": "Local" if zone_id else "Kathmandu"
+    }
+
+
+@app.get("/api/command/dhm-rainfall")
+@app.get("/api/dhm-rainfall")
+async def get_dhm_rainfall(warning_only: bool = Query(default=False)):
+    """DHM Nepal Rainfall Watch data from official government rain-gauge stations."""
+    conn = get_pg_conn()
+    try:
+        latest = _get_table_last_fetched_at("dhm_station_readings")
+        if _is_stale(latest, timedelta(minutes=DHM_SYNC_MINUTES)):
+            try:
+                await source_sync.sync_dhm()
+            except Exception as e:
+                logger.warning(f"DHM refresh-on-read failed: {e}")
+        with conn.cursor() as cur:
+            if warning_only:
+                cur.execute("""
+                    SELECT station_id, station_name, district, lat, lon, elevation_m,
+                           rain_1hr, rain_3hr, rain_6hr, rain_12hr, rain_24hr,
+                           fetched_at, warning_level, status
+                    FROM dhm_station_readings
+                    WHERE warning_level IN ('warning', 'danger')
+                    ORDER BY warning_level DESC, rain_24hr DESC
+                    LIMIT 150
+                """)
+            else:
+                cur.execute("""
+                    SELECT station_id, station_name, district, lat, lon, elevation_m,
+                           rain_1hr, rain_3hr, rain_6hr, rain_12hr, rain_24hr,
+                           fetched_at, warning_level, status
+                    FROM dhm_station_readings
+                    ORDER BY fetched_at DESC, warning_level DESC, rain_24hr DESC
+                    LIMIT 500
+                """)
+            stations = []
+            for row in cur.fetchall():
+                d = dict(row)
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat()
+                stations.append(d)
+
+        data_is_stale = _is_stale(
+            _get_table_last_fetched_at("dhm_station_readings"),
+            timedelta(minutes=DHM_SYNC_MINUTES),
+        )
+        
+        return {
+            "stations": stations,
+            "count": len(stations),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "DHM Nepal Rainfall Watch",
+            "warning_only": warning_only,
+            "data_status": "stale" if data_is_stale else "fresh",
+        }
+    except Exception as e:
+        logger.warning(f"DHM rainfall data fetch failed: {e}")
+        return {
+            "stations": [],
+            "count": 0,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "DHM Nepal Rainfall Watch (unavailable)",
+            "data_status": "unavailable",
+            "error": str(e)
+        }
+
+
+@app.get("/api/command/landslide-catalog")
+async def get_landslide_catalog(
+    bbox: Optional[str] = Query(default=None),
+    year_from: Optional[int] = Query(default=None),
+    year_to: Optional[int] = Query(default=None),
+    trigger: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000)
+):
+    """NASA COOLR Landslide Catalog data for Nepal."""
+    conn = get_pg_conn()
+    try:
+        filters = []
+        params = []
+        
+        if bbox:
+            lat_min, lat_max, lon_min, lon_max = map(float, bbox.split(','))
+            filters.append("(lat >= %s AND lat <= %s AND lon >= %s AND lon <= %s)")
+            params.extend([lat_min, lat_max, lon_min, lon_max])
+        
+        if year_from:
+            filters.append("EXTRACT(YEAR FROM event_date) >= %s")
+            params.append(year_from)
+        
+        if year_to:
+            filters.append("EXTRACT(YEAR FROM event_date) <= %s")
+            params.append(year_to)
+        
+        if trigger:
+            filters.append("trigger = %s")
+            params.append(trigger)
+        
+        where_clause = ""
+        if filters:
+            where_clause = "WHERE " + " AND ".join(filters)
+        
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT event_id, event_date, lat, lon, district, province, type, 
+                       fatalities, injuries, trigger, source_url, imported_at
+                FROM landslide_catalog
+                {where_clause}
+                ORDER BY event_date DESC
+                LIMIT %s
+            """, params + [limit])
+            
+            events = []
+            for row in cur.fetchall():
+                d = dict(row)
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat()
+                events.append(d)
+        
+        return {
+            "events": events,
+            "count": len(events),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "NASA COOLR Landslide Catalog",
+            "bbox": bbox,
+            "year_range": f"{year_from or 'all'}-{year_to or 'all'}",
+            "trigger": trigger or "all"
+        }
+    except Exception as e:
+        logger.warning(f"Landslide catalog data fetch failed: {e}")
+        return {
+            "events": [],
+            "count": 0,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "NASA COOLR Landslide Catalog (unavailable)",
+            "error": str(e)
+        }
+
+
+@app.get("/api/command/bipad/incidents")
+@app.get("/api/bipad/incidents")
+async def get_bipad_incidents(
+    hazard: Optional[str] = Query(default="landslide"),
+    days: int = Query(default=30, ge=1, le=365)
+):
+    """BIPAD Portal Nepal disaster incidents data."""
+    conn = get_pg_conn()
+    try:
+        latest = _get_table_last_fetched_at("bipad_incidents")
+        if _is_stale(latest, timedelta(hours=BIPAD_INCIDENT_SYNC_HOURS)):
+            try:
+                await source_sync.sync_bipad_incidents(days=max(30, days))
+            except Exception as e:
+                logger.warning(f"BIPAD incidents refresh-on-read failed: {e}")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT bipad_id, title, hazard, district_id, district_name, province,
+                       lat, lon, deaths, missing, injured, families_affected,
+                       incident_date, verified, source_url, fetched_at
+                FROM bipad_incidents
+                WHERE hazard = %s
+                AND incident_date >= NOW() - (%s * INTERVAL '1 day')
+                ORDER BY incident_date DESC
+                LIMIT 500
+            """, (hazard, days))
+            
+            incidents = []
+            for row in cur.fetchall():
+                d = dict(row)
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat()
+                incidents.append(d)
+
+        data_is_stale = _is_stale(
+            _get_table_last_fetched_at("bipad_incidents"),
+            timedelta(hours=BIPAD_INCIDENT_SYNC_HOURS),
+        )
+        
+        return {
+            "incidents": incidents,
+            "count": len(incidents),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal",
+            "hazard": hazard,
+            "days": days,
+            "data_status": "stale" if data_is_stale else "fresh",
+        }
+    except Exception as e:
+        logger.warning(f"BIPAD incidents data fetch failed: {e}")
+        return {
+            "incidents": [],
+            "count": 0,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal (unavailable)",
+            "data_status": "unavailable",
+            "error": str(e)
+        }
+
+
+@app.get("/api/command/bipad/alerts")
+@app.get("/api/bipad/alerts")
+async def get_bipad_alerts():
+    """BIPAD Portal Nepal active alerts."""
+    conn = get_pg_conn()
+    try:
+        latest = _get_table_last_fetched_at("bipad_alerts")
+        if _is_stale(latest, timedelta(minutes=BIPAD_ALERT_SYNC_MINUTES)):
+            try:
+                await source_sync.sync_bipad_alerts()
+            except Exception as e:
+                logger.warning(f"BIPAD alerts refresh-on-read failed: {e}")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT alert_id, title, hazard, district_id, district_name, province,
+                       lat, lon, severity, status, alert_date, expiry_date,
+                       source_url, fetched_at
+                FROM bipad_alerts
+                WHERE status = 'active'
+                ORDER BY severity DESC, alert_date DESC
+                LIMIT 50
+            """)
+            
+            alerts = []
+            for row in cur.fetchall():
+                d = dict(row)
+                for k, v in d.items():
+                    if isinstance(v, datetime):
+                        d[k] = v.isoformat()
+                alerts.append(d)
+
+        data_is_stale = _is_stale(
+            _get_table_last_fetched_at("bipad_alerts"),
+            timedelta(minutes=BIPAD_ALERT_SYNC_MINUTES),
+        )
+        
+        return {
+            "alerts": alerts,
+            "count": len(alerts),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal",
+            "data_status": "stale" if data_is_stale else "fresh",
+        }
+    except Exception as e:
+        logger.warning(f"BIPAD alerts data fetch failed: {e}")
+        return {
+            "alerts": [],
+            "count": 0,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal (unavailable)",
+            "data_status": "unavailable",
+            "error": str(e)
+        }
+
+
+@app.get("/api/command/bipad/summary")
+@app.get("/api/bipad/summary")
+async def get_bipad_summary():
+    """BIPAD Portal Nepal disaster summary for current monsoon season."""
+    conn = get_pg_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    COUNT(*) as total_events,
+                    SUM(deaths) as total_deaths,
+                    SUM(missing) as total_missing,
+                    SUM(injured) as total_injured,
+                    SUM(families_affected) as total_families,
+                    COUNT(DISTINCT district_id) as affected_districts,
+                    MAX(incident_date) as last_event_date
+                FROM bipad_incidents
+                WHERE hazard IN ('landslide', 'flood')
+                AND incident_date >= DATE_TRUNC('month', CURRENT_DATE)
+            """)
+            
+            summary = dict(cur.fetchone())
+            
+            cur.execute("""
+                SELECT hazard, COUNT(*) as count
+                FROM bipad_incidents
+                WHERE hazard IN ('landslide', 'flood')
+                AND incident_date >= DATE_TRUNC('month', CURRENT_DATE)
+                GROUP BY hazard
+            """)
+            
+            hazard_breakdown = [dict(r) for r in cur.fetchall()]
+        
+        return {
+            "summary": summary,
+            "hazard_breakdown": hazard_breakdown,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal",
+            "period": "Current monsoon season",
+            "data_status": "fresh",
+        }
+    except Exception as e:
+        logger.warning(f"BIPAD summary data fetch failed: {e}")
+        return {
+            "summary": {},
+            "hazard_breakdown": [],
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "source": "BIPAD Portal Nepal (unavailable)",
+            "data_status": "unavailable",
+            "error": str(e)
+        }
+
+@app.get("/api/command/source-status")
+@app.get("/api/source-status")
+async def get_source_status():
+    """Operational status for DHM/BIPAD/COOLR source sync jobs."""
+    statuses = await source_sync.get_status_snapshot()
+    return {
+        "sources": statuses,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
 

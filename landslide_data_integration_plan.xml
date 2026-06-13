@@ -1,0 +1,729 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================
+  NEPAL LANDSLIDE DETECTOR — DATA INTEGRATION PLAN
+  File    : landslide_data_integration_plan.xml
+  Version : 1.0
+  Author  : Data Integration Team
+  Covers  : PRD + TRD for all external data sources
+  Status  : Open-Meteo = DONE | Others = IN PROGRESS / PLANNED
+  ============================================================
+-->
+
+<integration-plan>
+
+  <!-- ══════════════════════════════════════════════════════
+       META
+  ══════════════════════════════════════════════════════════ -->
+  <meta>
+    <project>Nepal Landslide Early Warning System</project>
+    <component>Data Integration Layer</component>
+    <version>1.0.0</version>
+    <date>2026-06-13</date>
+    <region>
+      <country>Nepal</country>
+      <bounding-box>
+        <lat-min>26.347</lat-min>
+        <lat-max>30.447</lat-max>
+        <lon-min>80.058</lon-min>
+        <lon-max>88.201</lon-max>
+      </bounding-box>
+    </region>
+    <environments>
+      <env id="trd">Technical Requirements — how to fetch, parse, store</env>
+      <env id="prd">Product Requirements — what the dashboard shows, why it matters</env>
+    </environments>
+  </meta>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 1 — OPEN-METEO  [STATUS: DONE]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="open-meteo" status="done" priority="1">
+    <name>Open-Meteo Weather API</name>
+    <provider>Open-Meteo (open-source)</provider>
+    <base-url>https://api.open-meteo.com/v1/forecast</base-url>
+    <auth>none</auth>
+
+    <prd>
+      <goal>Display real-time and 7-day forecast rainfall for any Nepal district on the dashboard.</goal>
+      <dashboard-widgets>
+        <widget>Hourly precipitation bar chart (mm)</widget>
+        <widget>Daily forecast card per district</widget>
+        <widget>Rainfall threshold alert badge (green / amber / red)</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>Rainfall updates every 1 hour automatically</criterion>
+        <criterion>Alert fires when precipitation exceeds 60 mm/hr</criterion>
+        <criterion>Historical 7-day rainfall visible per district</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <endpoint>https://api.open-meteo.com/v1/forecast</endpoint>
+      <method>GET</method>
+      <params>
+        <param name="latitude">district centroid lat</param>
+        <param name="longitude">district centroid lon</param>
+        <param name="hourly">precipitation,rain,precipitation_probability</param>
+        <param name="daily">precipitation_sum,precipitation_hours</param>
+        <param name="timezone">Asia/Kathmandu</param>
+        <param name="past_days">7</param>
+        <param name="forecast_days">7</param>
+      </params>
+      <response-format>JSON</response-format>
+      <key-fields>
+        <field path="hourly.precipitation">mm per hour</field>
+        <field path="daily.precipitation_sum">mm per day</field>
+      </key-fields>
+      <polling-interval>60 minutes</polling-interval>
+      <thresholds>
+        <threshold level="low"    value="0"  unit="mm/hr"/>
+        <threshold level="medium" value="30" unit="mm/hr"/>
+        <threshold level="high"   value="60" unit="mm/hr" alert="true"/>
+        <threshold level="extreme" value="80" unit="mm/3hr" alert="true"/>
+      </thresholds>
+      <notes>Already implemented. No changes needed unless adding more districts.</notes>
+    </trd>
+
+    <implementation-prompt>
+      Already done. To extend: fetch for all 77 Nepal districts using their centroids.
+      Store lat/lon list in a districts.json file and loop through with Promise.all().
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 2 — DHM NEPAL RAINFALL WATCH  [STATUS: IN PROGRESS]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="dhm-nepal" status="in-progress" priority="2">
+    <name>DHM Nepal Rainfall Watch</name>
+    <provider>Department of Hydrology and Meteorology, Government of Nepal</provider>
+    <base-url>https://www.dhm.gov.np</base-url>
+    <auth>none (public scrape or internal WMS)</auth>
+
+    <prd>
+      <goal>
+        Pull official Nepal government rain-gauge station readings and overlay
+        on the dashboard map. This is the ground-truth source for Nepal rainfall —
+        more accurate than satellite-derived data for known station locations.
+      </goal>
+      <dashboard-widgets>
+        <widget>Nepal map with rain-gauge station pins (colour-coded by mm)</widget>
+        <widget>Station data table: name, district, elevation, last reading, status</widget>
+        <widget>Official DHM warning level indicator per station</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>Show at least 100 DHM hydro-met stations on the map</criterion>
+        <criterion>Display reading timestamps so stale data is visible</criterion>
+        <criterion>Match DHM official warning thresholds: 60mm/1hr, 80mm/3hr, 100mm/6hr, 120mm/12hr, 140mm/24hr</criterion>
+        <criterion>Flag stations with no update in last 3 hours as "offline"</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <approach>
+        DHM does not expose a public JSON REST API. Use one of these two methods:
+        Method A — WMS/WFS tiles from DHM GIS server (preferred, stable).
+        Method B — Scrape the rainfall-watch-map page HTML table (fragile, fallback).
+      </approach>
+
+      <method-a id="dhm-wms">
+        <description>DHM publishes hydro-met data via a WMS GIS layer</description>
+        <endpoint>https://geoportal.dhm.gov.np/server/rest/services</endpoint>
+        <steps>
+          <step order="1">Browse DHM GeoPortal to find the rainfall FeatureService URL</step>
+          <step order="2">Call /query endpoint with where=1=1 and outFields=* and f=json</step>
+          <step order="3">Parse features[] array: each feature has station_name, district, rainfall_1hr, rainfall_24hr, latitude, longitude</step>
+          <step order="4">Cache response in your backend, refresh every 30 min</step>
+        </steps>
+        <example-url>https://geoportal.dhm.gov.np/server/rest/services/Hydrology/HMS_Rainfall/FeatureServer/0/query?where=1%3D1&amp;outFields=*&amp;f=json</example-url>
+      </method-a>
+
+      <method-b id="dhm-scrape">
+        <description>Fallback: server-side scrape of the DHM rainfall table</description>
+        <url>https://www.dhm.gov.np/hydrology/rainfall-watch-map</url>
+        <tool>Cheerio (Node.js) or BeautifulSoup (Python)</tool>
+        <steps>
+          <step order="1">GET the page HTML server-side (CORS blocks browser fetch)</step>
+          <step order="2">Parse table rows: each row = one station</step>
+          <step order="3">Extract: Station Name | District | Elevation | 1Hr | 3Hr | 6Hr | 24Hr | Date-Time</step>
+          <step order="4">Convert to JSON and cache in your database</step>
+          <step order="5">Schedule scrape every 30 minutes via cron job</step>
+        </steps>
+        <cors-note>DHM site blocks browser-side fetch. Must run scrape from your backend server, not the client.</cors-note>
+      </method-b>
+
+      <storage>
+        <table>dhm_station_readings</table>
+        <columns>station_id, station_name, district, lat, lon, elevation_m, rain_1hr, rain_3hr, rain_6hr, rain_12hr, rain_24hr, fetched_at</columns>
+      </storage>
+
+      <thresholds>
+        <threshold duration="1hr"  mm="60"  level="warning"/>
+        <threshold duration="3hr"  mm="80"  level="warning"/>
+        <threshold duration="6hr"  mm="100" level="warning"/>
+        <threshold duration="12hr" mm="120" level="danger"/>
+        <threshold duration="24hr" mm="140" level="danger"/>
+      </thresholds>
+    </trd>
+
+    <implementation-prompt>
+      Write a Node.js/Express backend route GET /api/dhm-rainfall that:
+      1. Fetches https://geoportal.dhm.gov.np/server/rest/services rainfall FeatureServer.
+      2. Falls back to scraping https://www.dhm.gov.np/hydrology/rainfall-watch-map using axios + cheerio if GeoPortal fails.
+      3. Returns JSON array of stations with fields: station_name, district, lat, lon, rain_1hr, rain_3hr, rain_24hr, warning_level.
+      4. Calculates warning_level as "safe" | "watch" | "warning" | "danger" based on DHM official thresholds.
+      5. Caches result for 30 minutes to avoid hammering DHM servers.
+      Frontend: render stations as circle markers on a Leaflet/Mapbox map coloured by warning_level.
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 3 — NASA COOLR / GLOBAL LANDSLIDE CATALOG  [STATUS: NOT STARTED]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="nasa-coolr" status="not-started" priority="3">
+    <name>NASA COOLR — Global Landslide Catalog</name>
+    <provider>NASA Goddard Space Flight Center</provider>
+    <base-url>https://maps.nccs.nasa.gov/arcgis/rest/services/landslide_v2/MapServer</base-url>
+    <auth>NASA Earthdata account (free registration at urs.earthdata.nasa.gov)</auth>
+
+    <prd>
+      <goal>
+        Show historical landslide events in Nepal on the dashboard map.
+        This gives users context: which areas have had past events, how often,
+        and what rainfall triggered them — essential for risk communication.
+      </goal>
+      <dashboard-widgets>
+        <widget>Historical landslide heatmap overlaid on Nepal terrain map</widget>
+        <widget>Timeline chart: landslide events per year in Nepal (2007–present)</widget>
+        <widget>Popup on each event point: date, location, fatalities, trigger (rainfall/earthquake)</widget>
+        <widget>Monsoon season filter: Jun–Sep highlights</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>Filter catalog to Nepal bounding box only</criterion>
+        <criterion>Show event count, total fatalities per district as a choropleth</criterion>
+        <criterion>Allow filtering by year range, trigger type, severity</criterion>
+        <criterion>Link each event to source URL / news report if available</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <approach>Two access methods: ArcGIS REST API (live query) or static CSV download (batch load).</approach>
+
+      <method-a id="coolr-arcgis">
+        <description>Live query via NASA ArcGIS FeatureServer</description>
+        <endpoint>https://maps.nccs.nasa.gov/arcgis/rest/services/landslide_v2/MapServer/0/query</endpoint>
+        <params>
+          <param name="where">country_name='Nepal'</param>
+          <param name="outFields">event_id,event_date,event_title,landslide_type,fatality_count,injury_count,rainfall_trigger,latitude,longitude,source_link</param>
+          <param name="f">json</param>
+          <param name="resultRecordCount">2000</param>
+        </params>
+        <notes>May require NASA Earthdata Bearer token in Authorization header</notes>
+      </method-a>
+
+      <method-b id="coolr-csv">
+        <description>Download full catalog CSV once and filter locally (no auth needed)</description>
+        <download-url>https://gpm.nasa.gov/landslides/data.html — click "Download Landslide Catalog"</download-url>
+        <file-format>CSV (~11,000 rows global)</file-format>
+        <filter-column>country_name = "Nepal"</filter-column>
+        <load-strategy>Import into your database on first run; refresh monthly</load-strategy>
+      </method-b>
+
+      <key-fields>
+        <field>event_date — ISO date string</field>
+        <field>latitude / longitude — point location</field>
+        <field>landslide_type — debris flow, rockfall, mudslide, etc.</field>
+        <field>fatality_count — integer</field>
+        <field>rainfall_trigger — boolean / confidence</field>
+        <field>notes — free text description</field>
+      </key-fields>
+
+      <storage>
+        <table>landslide_catalog</table>
+        <columns>event_id, event_date, lat, lon, district, province, type, fatalities, injuries, trigger, source_url, imported_at</columns>
+        <index>CREATE INDEX ON landslide_catalog (lat, lon); CREATE INDEX ON landslide_catalog (event_date);</index>
+      </storage>
+
+      <refresh-strategy>Monthly batch refresh (catalog updates slowly)</refresh-strategy>
+    </trd>
+
+    <implementation-prompt>
+      Write a data ingestion script (Python or Node.js) that:
+      1. Downloads the NASA COOLR CSV from the landslide viewer download link.
+      2. Filters rows where country_name = "Nepal" (approx 300–500 events).
+      3. Geocodes missing district names using lat/lon against Nepal admin boundary GeoJSON (from geojson-nepal npm package or HDX dataset).
+      4. Inserts into PostgreSQL table landslide_catalog with upsert on event_id.
+      5. Creates a GET /api/catalog endpoint that returns events filtered by:
+         - bbox (lat_min, lat_max, lon_min, lon_max)
+         - year_from, year_to
+         - trigger (rainfall | earthquake | all)
+      6. Frontend: render as clustered CircleMarkers on Leaflet; red = fatalities > 5, orange = 1-5, yellow = 0.
+      Run this script on deployment and add a monthly cron to refresh.
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 4 — BIPAD PORTAL NEPAL  [STATUS: IN PROGRESS / NOT WORKING]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="bipad" status="in-progress-broken" priority="2">
+    <name>BIPAD Portal Nepal</name>
+    <provider>NDRRMA — National Disaster Risk Reduction and Management Authority, Gov. of Nepal</provider>
+    <base-url>https://bipadportal.gov.np</base-url>
+    <api-base>https://bipadportal.gov.np/api/v1</api-base>
+    <auth>
+      <type>API Token (Bearer)</type>
+      <registration>Request at bipadportal.gov.np — contact NDRRMA for developer access</registration>
+      <header>Authorization: Token YOUR_API_TOKEN</header>
+    </auth>
+
+    <prd>
+      <goal>
+        Pull live and historical disaster events (floods, landslides) from Nepal's
+        official government disaster information system. This is the most authoritative
+        Nepal-specific source for disaster incident records, loss data, and real-time alerts.
+      </goal>
+      <dashboard-widgets>
+        <widget>Real-time alert feed: latest disaster events in Nepal (last 7 days)</widget>
+        <widget>District-level incident count map (choropleth)</widget>
+        <widget>Loss table: deaths, missing, injured, families affected per event</widget>
+        <widget>Monsoon season summary card</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>Show events filtered to hazard_type = "landslide" and "flood"</criterion>
+        <criterion>Display district name, date, casualties, affected families</criterion>
+        <criterion>Alert badge when a new event is reported in the last 24 hours</criterion>
+        <criterion>Link to official BIPAD event URL for details</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <common-issue>
+        The BIPAD API requires a Bearer token that expires and must be refreshed.
+        Most "not working" issues are due to: expired token, wrong header format,
+        or using the wrong API version (v1 vs v2).
+      </common-issue>
+
+      <endpoints>
+        <endpoint id="events">
+          <path>/api/v1/incident/</path>
+          <method>GET</method>
+          <auth-required>true</auth-required>
+          <params>
+            <param name="hazard">landslide</param>
+            <param name="district">77 (or district id)</param>
+            <param name="date_from">2024-01-01</param>
+            <param name="date_to">2024-12-31</param>
+            <param name="format">json</param>
+          </params>
+          <response-fields>id, title, hazard, district, loss_human_death, loss_human_missing, loss_human_injured, loss_family_affected, incident_on, verified</response-fields>
+        </endpoint>
+
+        <endpoint id="alerts">
+          <path>/api/v1/alert/</path>
+          <method>GET</method>
+          <auth-required>true</auth-required>
+          <params>
+            <param name="status">active</param>
+          </params>
+        </endpoint>
+
+        <endpoint id="realtime">
+          <path>/api/v1/realtime/</path>
+          <method>GET</method>
+          <auth-required>true</auth-required>
+          <notes>Real-time module for live sensor / weather station feeds</notes>
+        </endpoint>
+      </endpoints>
+
+      <debugging-steps>
+        <step order="1">Verify token: curl -H "Authorization: Token YOUR_TOKEN" https://bipadportal.gov.np/api/v1/incident/?format=json</step>
+        <step order="2">If 401 → token expired. Re-login via POST /api/v1/auth/login/ with username+password to get a new token.</step>
+        <step order="3">If 403 → your account doesn't have API access. Email NDRRMA to enable it.</step>
+        <step order="4">If CORS error → the BIPAD API does NOT support browser-side fetch. Must proxy through your backend.</step>
+        <step order="5">Check Accept header: set Accept: application/json explicitly.</step>
+      </debugging-steps>
+
+      <backend-proxy>
+        <description>Create a backend proxy to avoid CORS and hide your token</description>
+        <route>GET /api/bipad/incidents</route>
+        <implementation>
+          Your server calls bipadportal.gov.np with the token in headers.
+          Returns filtered JSON to your frontend.
+          Cache responses for 15 minutes.
+        </implementation>
+      </backend-proxy>
+
+      <token-refresh>
+        <login-endpoint>POST https://bipadportal.gov.np/api/v1/auth/login/</login-endpoint>
+        <body>{ "username": "your_username", "password": "your_password" }</body>
+        <response>{ "token": "NEW_TOKEN_HERE" }</response>
+        <strategy>Store token in environment variable. On 401, auto-refresh token and retry once.</strategy>
+      </token-refresh>
+
+      <storage>
+        <table>bipad_incidents</table>
+        <columns>bipad_id, title, hazard, district_id, district_name, province, lat, lon, deaths, missing, injured, families_affected, incident_date, verified, source_url, fetched_at</columns>
+      </storage>
+
+      <polling-interval>15 minutes for alerts; 6 hours for historical incidents</polling-interval>
+    </trd>
+
+    <implementation-prompt>
+      Fix the broken BIPAD integration with this approach:
+      1. Backend: create a token store — on server start, POST to /api/v1/auth/login/ and store the token.
+      2. Create an axios instance with baseURL=https://bipadportal.gov.np and Authorization header set.
+      3. Add a response interceptor: on 401, refresh token and retry the original request once.
+      4. Create these backend routes (all proxied through your server to avoid CORS):
+         - GET /api/bipad/incidents?hazard=landslide&amp;days=30 → returns last 30 days of landslide events
+         - GET /api/bipad/alerts → returns active alerts
+         - GET /api/bipad/summary → returns death/missing/injured totals for current monsoon season
+      5. Frontend: poll /api/bipad/alerts every 5 minutes; show a notification banner if new events appear.
+      6. Add error state: if BIPAD is unreachable, show "BIPAD data unavailable" badge and use cached data.
+      Test with: curl -X POST https://bipadportal.gov.np/api/v1/auth/login/ -d '{"username":"X","password":"Y"}' -H "Content-Type: application/json"
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 5 — COPERNICUS DEM / SRTM  [STATUS: NOT STARTED]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="copernicus-dem" status="not-started" priority="4">
+    <name>Copernicus DEM / SRTM Digital Elevation Model</name>
+    <provider>ESA Copernicus / NASA SRTM via OpenTopography</provider>
+    <base-url>https://portal.opentopography.org/API/globaldem</base-url>
+    <auth>
+      <type>API Key</type>
+      <registration>Free at opentopography.org/developers</registration>
+      <header>API_Key query parameter or Authorization header</header>
+    </auth>
+
+    <prd>
+      <goal>
+        Provide slope, aspect, and elevation layers as static background context on
+        the dashboard map. Slope angle is the most critical static factor for
+        landslide susceptibility — steep slopes (greater than 30°) dramatically
+        increase risk when combined with heavy rainfall.
+      </goal>
+      <dashboard-widgets>
+        <widget>Hillshade terrain base layer on the map (replaces flat map tiles)</widget>
+        <widget>Slope angle overlay (toggle on/off): green = flat, orange = moderate, red = steep</widget>
+        <widget>Elevation profile chart when user draws a line on the map</widget>
+        <widget>Susceptibility index layer computed from slope + soil + land-cover</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>DEM data covers all 77 Nepal districts</criterion>
+        <criterion>Slope layer pre-computed and served as raster tiles (not fetched live)</criterion>
+        <criterion>Hillshade renders correctly at zoom levels 8–14</criterion>
+        <criterion>Elevation shown in metres in map tooltips</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <approach>
+        DEM is a one-time download, not a live API. Download once, process into tiles,
+        serve from your own tile server or CDN. Do NOT fetch live per request — files are large.
+      </approach>
+
+      <download-options>
+        <option id="opentopography-api">
+          <name>OpenTopography REST API (recommended for targeted bbox)</name>
+          <endpoint>https://portal.opentopography.org/API/globaldem</endpoint>
+          <params>
+            <param name="demtype">COP30</param><!-- Copernicus 30m resolution -->
+            <param name="south">26.347</param>
+            <param name="north">30.447</param>
+            <param name="west">80.058</param>
+            <param name="east">88.201</param>
+            <param name="outputFormat">GTiff</param>
+            <param name="API_Key">YOUR_KEY</param>
+          </params>
+          <output>nepal_dem_cop30.tif (~500MB for full Nepal)</output>
+        </option>
+
+        <option id="aws-s3">
+          <name>Copernicus DEM on AWS S3 (free, no auth)</name>
+          <endpoint>s3://copernicus-dem-30m/</endpoint>
+          <tool>AWS CLI or boto3</tool>
+          <command>aws s3 cp s3://copernicus-dem-30m/Copernicus_DSM_COG_10_N27_00_E084_00_DEM/ . --no-sign-request</command>
+          <notes>Download only the tiles covering Nepal (N26–N30, E080–E088). About 24 tiles.</notes>
+        </option>
+      </download-options>
+
+      <processing-pipeline>
+        <step order="1">Download Nepal DEM tiles using AWS CLI (no auth required)</step>
+        <step order="2">Merge tiles: gdal_merge.py -o nepal_dem.tif tile1.tif tile2.tif ...</step>
+        <step order="3">Compute slope: gdaldem slope nepal_dem.tif nepal_slope.tif</step>
+        <step order="4">Compute hillshade: gdaldem hillshade nepal_dem.tif nepal_hillshade.tif</step>
+        <step order="5">Convert to Cloud Optimised GeoTIFF: gdal_translate -of COG nepal_slope.tif nepal_slope_cog.tif</step>
+        <step order="6">Generate map tiles: gdal2tiles.py --zoom=6-14 nepal_hillshade.tif ./tiles/hillshade/</step>
+        <step order="7">Serve tiles from your server or upload to S3/Cloudflare R2</step>
+      </processing-pipeline>
+
+      <tools-required>GDAL (gdal-bin), Python with rasterio, tippecanoe (optional for vector tiles)</tools-required>
+
+      <frontend-integration>
+        <library>Leaflet with L.tileLayer or MapboxGL raster-dem source</library>
+        <hillshade-tile-url>https://your-server.com/tiles/hillshade/{z}/{x}/{y}.png</hillshade-tile-url>
+        <slope-tile-url>https://your-server.com/tiles/slope/{z}/{x}/{y}.png</slope-tile-url>
+      </frontend-integration>
+
+      <refresh-strategy>
+        Static — DEM does not change. Re-download only if a major earthquake changes terrain.
+        Re-download recommendation: after Mw 6.0+ earthquake in Nepal.
+      </refresh-strategy>
+    </trd>
+
+    <implementation-prompt>
+      Set up DEM processing pipeline:
+      1. Install GDAL: sudo apt-get install gdal-bin python3-gdal
+      2. Download Nepal Copernicus DEM tiles from AWS S3 (no auth): 
+         aws s3 sync s3://copernicus-dem-30m/ ./dem-tiles/ --exclude "*" --include "*/N2*E08*" --no-sign-request
+      3. Run: gdal_merge.py -o nepal_dem.tif dem-tiles/**/*.tif
+      4. Run: gdaldem slope nepal_dem.tif nepal_slope.tif -compute_edges
+      5. Run: gdaldem hillshade nepal_dem.tif nepal_hillshade.tif -z 2 -s 111120
+      6. Classify slope into risk zones and colorize:
+         gdaldem color-relief nepal_slope.tif slope_colors.txt nepal_slope_colored.tif
+         (slope_colors.txt: 0 green, 15 yellow, 30 orange, 45 red, 90 darkred)
+      7. Generate tiles: gdal2tiles.py --zoom=7-13 --processes=4 nepal_slope_colored.tif ./public/tiles/slope/
+      8. In your Leaflet map: L.tileLayer('/tiles/slope/{z}/{x}/{y}.png', {opacity: 0.5}).addTo(map)
+      9. Add a layer toggle button so users can turn slope overlay on/off.
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       SOURCE 6 — SENTINEL-1 SAR (GROUND MOTION)  [STATUS: NOT STARTED]
+  ══════════════════════════════════════════════════════════ -->
+  <source id="sentinel-sar" status="not-started" priority="5">
+    <name>Sentinel-1 SAR — Ground Motion Detection</name>
+    <provider>ESA Copernicus / Alaska Satellite Facility (ASF)</provider>
+    <base-url>https://api.daac.asf.alaska.gov</base-url>
+    <auth>
+      <type>NASA Earthdata OAuth2</type>
+      <registration>Free at urs.earthdata.nasa.gov — then enable ASF DAAC app</registration>
+      <token-endpoint>https://urs.earthdata.nasa.gov/oauth/token</token-endpoint>
+    </auth>
+
+    <prd>
+      <goal>
+        Detect ground surface deformation (slope creep, land movement) before and
+        after a landslide event using SAR (Synthetic Aperture Radar) satellite images.
+        This is the most advanced layer — it adds predictive power by spotting
+        unstable slopes before they fail.
+      </goal>
+      <dashboard-widgets>
+        <widget>Ground deformation map overlay: mm/year displacement per pixel (InSAR)</widget>
+        <widget>Change detection alert: areas with sudden deformation spike in last 12-day SAR pass</widget>
+        <widget>Pre/post event image comparison slider for confirmed landslide locations</widget>
+        <widget>SAR acquisition calendar: when was the last satellite pass over each district?</widget>
+      </dashboard-widgets>
+      <acceptance-criteria>
+        <criterion>Show InSAR displacement layer for Nepal on the dashboard map</criterion>
+        <criterion>Alert when a new SAR pass shows deformation greater than 20mm in a high-risk zone</criterion>
+        <criterion>Data updates every 12 days (Sentinel-1 revisit time over Nepal)</criterion>
+        <criterion>Graceful degradation: if SAR unavailable, show "last pass" date and cached layer</criterion>
+      </acceptance-criteria>
+    </prd>
+
+    <trd>
+      <approach>
+        SAR processing (InSAR) is computationally heavy. Use one of:
+        Option A — ASF HyP3 (cloud-processed InSAR, recommended, no GPU needed).
+        Option B — Google Earth Engine (hosted processing, free quota).
+        Option C — Download raw Sentinel-1 SLC and process locally with SNAP (advanced, slow).
+      </approach>
+
+      <option-a id="asf-hyp3" recommended="true">
+        <name>ASF HyP3 On-Demand InSAR Processing</name>
+        <description>
+          Submit Sentinel-1 scene pairs to ASF HyP3 API.
+          HyP3 runs GAMMA InSAR processing in the cloud.
+          You get back a GeoTIFF of displacement (mm) within hours.
+        </description>
+        <steps>
+          <step order="1">Register at urs.earthdata.nasa.gov and enable ASF DAAC app</step>
+          <step order="2">Search for Sentinel-1 scenes over Nepal using ASF Vertex or Search API</step>
+          <step order="3">Submit an InSAR job for a scene pair (reference + secondary image, 12 days apart)</step>
+          <step order="4">Poll job status; download output GeoTIFF when complete</step>
+          <step order="5">Display displacement raster on dashboard map</step>
+        </steps>
+
+        <api-calls>
+          <call id="search">
+            <endpoint>https://api.daac.asf.alaska.gov/services/search/param</endpoint>
+            <method>GET</method>
+            <params>
+              <param name="platform">Sentinel-1</param>
+              <param name="processingLevel">SLC</param>
+              <param name="beamMode">IW</param>
+              <param name="bbox">80.058,26.347,88.201,30.447</param>
+              <param name="output">json</param>
+              <param name="maxResults">5</param>
+            </params>
+          </call>
+
+          <call id="submit-job">
+            <endpoint>https://hyp3-api.asf.alaska.edu/jobs</endpoint>
+            <method>POST</method>
+            <auth>Bearer token from Earthdata</auth>
+            <body>
+              {
+                "jobs": [{
+                  "job_type": "INSAR_GAMMA",
+                  "name": "nepal-landslide-insar",
+                  "job_parameters": {
+                    "granules": ["REFERENCE_SCENE_ID", "SECONDARY_SCENE_ID"],
+                    "looks": "20x4",
+                    "include_displacement_maps": true,
+                    "apply_water_mask": false
+                  }
+                }]
+              }
+            </body>
+          </call>
+
+          <call id="check-status">
+            <endpoint>https://hyp3-api.asf.alaska.edu/jobs/{job_id}</endpoint>
+            <method>GET</method>
+            <response-field>status_code: PENDING | RUNNING | SUCCEEDED | FAILED</response-field>
+          </call>
+
+          <call id="download">
+            <description>When SUCCEEDED, download .files[].url — a GeoTIFF zip</description>
+            <output-files>
+              <file>*_wrapped_phase.tif — raw interferogram</file>
+              <file>*_displacement.tif — displacement in metres</file>
+              <file>*_coherence.tif — signal quality (0–1)</file>
+            </output-files>
+          </call>
+        </api-calls>
+
+        <processing-limit>Free tier: 1000 HyP3 processing units/month</processing-limit>
+      </option-a>
+
+      <option-b id="gee">
+        <name>Google Earth Engine (alternative)</name>
+        <description>Run InSAR or change detection directly in GEE using Sentinel-1 GRD images.</description>
+        <collection>COPERNICUS/S1_GRD</collection>
+        <script-outline>
+          var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+            .filterBounds(nepal_geometry)
+            .filterDate('2024-06-01', '2024-09-30')
+            .filter(ee.Filter.eq('instrumentMode', 'IW'))
+            .select('VV');
+          var before = s1.filterDate('2024-06-01','2024-06-13').mean();
+          var after  = s1.filterDate('2024-06-14','2024-06-26').mean();
+          var change = after.subtract(before);
+        </script-outline>
+        <output>Export to Google Drive as GeoTIFF, then serve as map tile</output>
+        <notes>GEE does not do full InSAR but detects backscatter change useful for post-event mapping</notes>
+      </option-b>
+
+      <storage>
+        <table>sar_products</table>
+        <columns>job_id, scene_reference, scene_secondary, acquisition_date, product_url, displacement_tif_path, coherence_tif_path, processed_at, status</columns>
+      </storage>
+
+      <schedule>
+        Sentinel-1 passes over Nepal approximately every 12 days.
+        Schedule a job submission every 12 days aligned to the satellite pass schedule.
+        Monitor: https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-1/observation-scenario
+      </schedule>
+    </trd>
+
+    <implementation-prompt>
+      Implement SAR integration using ASF HyP3 in these phases:
+      PHASE 1 — Scene Search (Week 1):
+        Write a script that calls the ASF Search API to find the 2 most recent
+        Sentinel-1 SLC scenes over Nepal (12 days apart, same relative orbit).
+        Store scene IDs in your database.
+      PHASE 2 — Job Submission (Week 1-2):
+        POST to https://hyp3-api.asf.alaska.edu/jobs with INSAR_GAMMA job type.
+        Store job_id and poll /jobs/{job_id} every 10 minutes until status = SUCCEEDED.
+        Download the _displacement.tif file when done.
+      PHASE 3 — Tile Generation (Week 2):
+        Convert displacement GeoTIFF to colourised map tiles using gdal2tiles.py.
+        Positive values (uplift) = blue, negative (subsidence/slide) = red.
+        Overlay on the dashboard Leaflet map as a semi-transparent tile layer.
+      PHASE 4 — Alerting (Week 3):
+        Compute zonal statistics for each district: mean displacement from latest InSAR.
+        If mean displacement in a district exceeds 20mm downslope, trigger an alert.
+        Store alert in database and push to dashboard notification panel.
+      Test first with a single Sentinel-1 pair over Sindhupalchowk district
+      (high landslide history) before scaling to all Nepal.
+    </implementation-prompt>
+  </source>
+
+  <!-- ══════════════════════════════════════════════════════
+       INTEGRATION ARCHITECTURE
+  ══════════════════════════════════════════════════════════ -->
+  <architecture>
+    <backend-stack>
+      <layer name="API Gateway">Node.js / Express — single entry point for all data proxying</layer>
+      <layer name="Data Fetchers">One service module per source (dhm.service.js, bipad.service.js, etc.)</layer>
+      <layer name="Cache">Redis — 15min TTL for live feeds, 24hr for catalogs</layer>
+      <layer name="Database">PostgreSQL with PostGIS extension for spatial queries</layer>
+      <layer name="Job Queue">Bull / node-cron for scheduled fetches and HyP3 polling</layer>
+      <layer name="Tile Server">TilesServer or nginx serving static gdal2tiles output</layer>
+    </backend-stack>
+
+    <frontend-stack>
+      <layer name="Map">Leaflet.js or MapboxGL — base map + overlays</layer>
+      <layer name="Charts">Chart.js or Recharts — rainfall timelines, event counts</layer>
+      <layer name="State">React context or Zustand — live data subscriptions</layer>
+      <layer name="Alerts">WebSocket or SSE — push new BIPAD alerts to all connected dashboards</layer>
+    </frontend-stack>
+
+    <data-flow>
+      <flow id="live-rainfall">
+        Open-Meteo API → /api/weather → Frontend rainfall chart
+        DHM Nepal (scrape) → /api/dhm-rainfall → Map station pins
+      </flow>
+      <flow id="risk-layer">
+        Copernicus DEM (pre-processed) → slope tiles → Map slope overlay
+        NASA SMAP soil moisture → /api/soil → Risk calculation
+        LHASA FeatureServer → /api/lhasa → Hazard nowcast layer
+      </flow>
+      <flow id="historical">
+        NASA COOLR CSV (monthly) → landslide_catalog table → /api/catalog → Map cluster markers
+        BIPAD incidents (6hr) → bipad_incidents table → /api/bipad/incidents → Event feed
+      </flow>
+      <flow id="advanced">
+        ASF Sentinel-1 search (12-day) → HyP3 InSAR job → displacement.tif → slope tiles → Map deformation layer
+      </flow>
+    </data-flow>
+  </architecture>
+
+  <!-- ══════════════════════════════════════════════════════
+       IMPLEMENTATION ROADMAP
+  ══════════════════════════════════════════════════════════ -->
+  <roadmap>
+    <phase id="1" duration="1 week" label="Fix broken integrations">
+      <task>Fix BIPAD token refresh — implement auto-refresh on 401</task>
+      <task>Implement DHM scraper backend route with cheerio</task>
+      <task>Test both with curl before connecting to frontend</task>
+    </phase>
+    <phase id="2" duration="1 week" label="Add static layers">
+      <task>Download Nepal Copernicus DEM from AWS S3</task>
+      <task>Run GDAL slope + hillshade processing pipeline</task>
+      <task>Generate and serve map tiles at zoom 7–13</task>
+      <task>Add tile layer toggle on Leaflet map</task>
+    </phase>
+    <phase id="3" duration="1 week" label="Historical catalog">
+      <task>Download NASA COOLR CSV and import Nepal events into PostgreSQL</task>
+      <task>Create /api/catalog endpoint with bbox and date filters</task>
+      <task>Render clustered markers on map</task>
+    </phase>
+    <phase id="4" duration="2 weeks" label="SAR ground motion (advanced)">
+      <task>Register for ASF Earthdata account and test HyP3 API with Postman</task>
+      <task>Build scene-search + job-submission script for one test district</task>
+      <task>Process output displacement GeoTIFF into colourised tiles</task>
+      <task>Overlay on dashboard and add displacement alert logic</task>
+    </phase>
+    <phase id="5" duration="ongoing" label="Monitoring and maintenance">
+      <task>Add data freshness indicators on dashboard (last updated timestamps)</task>
+      <task>Set up uptime monitor for each data source endpoint</task>
+      <task>Monthly COOLR catalog refresh cron</task>
+      <task>12-day SAR job automation aligned to Sentinel-1 pass schedule</task>
+    </phase>
+  </roadmap>
+
+</integration-plan>

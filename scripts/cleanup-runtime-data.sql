@@ -15,6 +15,10 @@ DELETE FROM satellite_data
 WHERE source IN ('nasa_gpm', 'sentinel1', 'sentinel2')
    OR source LIKE '%simulated%'
    OR metadata->>'source' LIKE '%simulated%';
+DELETE FROM dhm_station_readings;
+DELETE FROM landslide_catalog;
+DELETE FROM bipad_incidents;
+DELETE FROM bipad_alerts;
 
 DELETE FROM osm_roads;
 DELETE FROM osm_settlements;

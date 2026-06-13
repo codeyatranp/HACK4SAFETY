@@ -176,3 +176,92 @@ CREATE INDEX IF NOT EXISTS idx_risk_history_level ON risk_scores_history(risk_le
 CREATE INDEX IF NOT EXISTS idx_alerts_zone_ts ON alerts(zone_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_level ON alerts(level, timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_unack ON alerts(zone_id, level) WHERE acknowledged = FALSE;
+
+-- ═══════════════════════════════════════════════════════════════
+-- EXTERNAL SOURCE TABLES — Dashboard live integrations
+-- ═══════════════════════════════════════════════════════════════
+
+-- ── DHM official station readings ──────────────────────────────
+CREATE TABLE IF NOT EXISTS dhm_station_readings (
+    station_id VARCHAR(100) PRIMARY KEY,
+    station_name VARCHAR(255),
+    district VARCHAR(120),
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    elevation_m DOUBLE PRECISION,
+    rain_1hr DOUBLE PRECISION,
+    rain_3hr DOUBLE PRECISION,
+    rain_6hr DOUBLE PRECISION,
+    rain_12hr DOUBLE PRECISION,
+    rain_24hr DOUBLE PRECISION,
+    fetched_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    source VARCHAR(60) NOT NULL DEFAULT 'dhm',
+    warning_level VARCHAR(20) NOT NULL DEFAULT 'safe',
+    status VARCHAR(20) NOT NULL DEFAULT 'online', -- online | offline
+    raw_payload JSONB
+);
+
+-- ── NASA COOLR / global landslide catalog (Nepal subset) ─────
+CREATE TABLE IF NOT EXISTS landslide_catalog (
+    event_id VARCHAR(120) PRIMARY KEY,
+    event_date TIMESTAMP WITH TIME ZONE,
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    district VARCHAR(120),
+    province VARCHAR(120),
+    type VARCHAR(120),
+    fatalities INTEGER DEFAULT 0,
+    injuries INTEGER DEFAULT 0,
+    trigger VARCHAR(80),
+    source_url TEXT,
+    imported_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    raw_payload JSONB
+);
+
+-- ── BIPAD incidents ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS bipad_incidents (
+    bipad_id VARCHAR(120) PRIMARY KEY,
+    title TEXT,
+    hazard VARCHAR(80),
+    district_id VARCHAR(60),
+    district_name VARCHAR(120),
+    province VARCHAR(120),
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    deaths INTEGER DEFAULT 0,
+    missing INTEGER DEFAULT 0,
+    injured INTEGER DEFAULT 0,
+    families_affected INTEGER DEFAULT 0,
+    incident_date TIMESTAMP WITH TIME ZONE,
+    verified BOOLEAN DEFAULT FALSE,
+    source_url TEXT,
+    fetched_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    raw_payload JSONB
+);
+
+-- ── BIPAD active alerts ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS bipad_alerts (
+    alert_id VARCHAR(120) PRIMARY KEY,
+    title TEXT,
+    hazard VARCHAR(80),
+    district_id VARCHAR(60),
+    district_name VARCHAR(120),
+    province VARCHAR(120),
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    severity VARCHAR(30),
+    status VARCHAR(30),
+    alert_date TIMESTAMP WITH TIME ZONE,
+    expiry_date TIMESTAMP WITH TIME ZONE,
+    source_url TEXT,
+    fetched_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    raw_payload JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_dhm_station_readings_fetched_at ON dhm_station_readings(fetched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dhm_station_readings_warning ON dhm_station_readings(warning_level, rain_24hr DESC);
+CREATE INDEX IF NOT EXISTS idx_landslide_catalog_event_date ON landslide_catalog(event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_landslide_catalog_trigger ON landslide_catalog(trigger);
+CREATE INDEX IF NOT EXISTS idx_landslide_catalog_lat_lon ON landslide_catalog(lat, lon);
+CREATE INDEX IF NOT EXISTS idx_bipad_incidents_date_hazard ON bipad_incidents(incident_date DESC, hazard);
+CREATE INDEX IF NOT EXISTS idx_bipad_alerts_status_date ON bipad_alerts(status, alert_date DESC);
