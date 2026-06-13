@@ -275,7 +275,7 @@ class NASAGPMFetcher:
                     data = self._process_gpm_netcdf(filepath)
                     if data:
                         for zid, vals in data.items():
-                            self._write_to_influxdb(zid, vals, source=f"nasa_gpm_{prod.split('.')[0].lower()}")
+                            self._write_to_influxdb(zid, vals, source=f"nasa_gpm_{prod.split('.')[0].lower()}", timestamp=target)
                         logger.info(f"GPM: SUCCESS - Processed {len(data)} zones from {prod}")
                         await self._close_client()
                         return
@@ -284,21 +284,32 @@ class NASAGPMFetcher:
         await self._simulate_and_write()
         await self._close_client()
 
-    async def _simulate_and_write(self):
-        """Realistic simulation fallback."""
+    async def _simulate_and_write(self, days_back: int = 1):
+        """Realistic simulation fallback with backfill support."""
         zones = self._load_zones()
-        month = datetime.now(timezone.utc).month
-        is_monsoon = 6 <= month <= 9
+        
+        logger.info(f"GPM: Simulating {len(zones)} zones for {days_back} days")
         
         for zone in zones:
-            base = random.uniform(2, 6) if is_monsoon else random.uniform(0, 1)
-            rainfall = {
-                "1hr_mm": round(max(0, random.gauss(base, base*0.3)), 1),
-                "24hr_mm": round(max(0, random.gauss(base*10, base*2)), 1)
-            }
-            self._write_to_influxdb(zone["zone_id"], rainfall, source="nasa_gpm_simulated")
+            for day_offset in range(days_back):
+                target_time = datetime.now(timezone.utc) - timedelta(days=day_offset)
+                # June–September: monsoon season (higher values)
+                month = target_time.month
+                is_monsoon = 6 <= month <= 9
+                
+                base = random.uniform(2, 6) if is_monsoon else random.uniform(0, 1)
+                rainfall = {
+                    "1hr_mm": round(max(0, random.gauss(base, base*0.3)), 1),
+                    "24hr_mm": round(max(0, random.gauss(base*10, base*2)), 1)
+                }
+                self._write_to_influxdb(
+                    zone["zone_id"], 
+                    rainfall, 
+                    source="nasa_gpm_simulated", 
+                    timestamp=target_time
+                )
 
-    def _write_to_influxdb(self, zone_id: str, rainfall: dict, source: str):
+    def _write_to_influxdb(self, zone_id: str, rainfall: dict, source: str, timestamp: datetime = None):
         """Write to InfluxDB."""
         try:
             from influxdb_client import InfluxDBClient, Point
@@ -311,7 +322,7 @@ class NASAGPMFetcher:
                     .tag("source", source) \
                     .field("rainfall_1hr_mm", float(rainfall.get("1hr_mm", 0.0))) \
                     .field("rainfall_24hr_mm", float(rainfall.get("24hr_mm", 0.0))) \
-                    .time(datetime.now(timezone.utc))
+                    .time(timestamp or datetime.now(timezone.utc))
                 
                 write_api.write(bucket=self.influx_bucket, org=self.influx_org, record=point)
         except Exception as e:

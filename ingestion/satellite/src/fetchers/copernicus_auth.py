@@ -105,19 +105,33 @@ class CopernicusAuth:
         if not token:
             return []
 
-        # Build OData filter - skip spatial and attribute filters due to CDSE OData syntax issues
-        # We'll do client-side filtering by bbox and attributes
+        # Build OData filter
+        # CDSE supports OData.CSC.Intersects for spatial filtering
+        west, south, east, north = bbox
+        # Counter-clockwise polygon: (west south, east south, east north, west north, west south)
+        wkt = f"POLYGON(({west} {south}, {east} {south}, {east} {north}, {west} {north}, {west} {south}))"
+        
         filters = [
             f"Collection/Name eq '{collection}'",
             f"ContentDate/Start gt {start_date}",
             f"ContentDate/End lt {end_date}",
+            f"OData.CSC.Intersects(area=geography'SRID=4326;{wkt}')"
         ]
+
+        if attributes:
+            for key, val in attributes.items():
+                if isinstance(val, str) and (val.startswith("<") or val.startswith(">")):
+                    filters.append(f"Attributes/OData.CSC.DoubleAttribute/any(att:att/Name eq '{key}' and att/Value {val})")
+                else:
+                    filters.append(f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq '{key}' and att/Value eq '{val}')")
 
         filter_str = " and ".join(filters)
 
         try:
+            url = f"{CDSE_CATALOG_URL}?$filter={filter_str}&$top={limit}&$orderby=ContentDate/Start desc"
+            logger.info(f"CDSE: searching with filter: {filter_str[:100]}...")
             resp = await self._client.get(
-                f"{CDSE_CATALOG_URL}?$filter={filter_str}&$top={limit}&$orderby=ContentDate/Start desc",
+                url,
                 headers={"Authorization": f"Bearer {token}"},
             )
 

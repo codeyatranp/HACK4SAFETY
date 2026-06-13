@@ -53,6 +53,13 @@ except ImportError:
     OSM_AVAILABLE = False
     logger.warning("OSM sync fetcher not available")
 
+try:
+    from fetchers.nasa_chirps import NASAChirpsFetcher
+    CHIRPS_AVAILABLE = True
+except ImportError:
+    CHIRPS_AVAILABLE = False
+    logger.warning("NASA CHIRPS fetcher not available (missing dependencies)")
+
 
 class SatelliteFetcher:
     """Main scheduler for all satellite and open data sources."""
@@ -120,11 +127,26 @@ class SatelliteFetcher:
         except Exception as e:
             logger.error(f"OSM sync failed: {e}")
 
+    async def fetch_chirps(self):
+        """Fetch NASA CHIRPS historical rainfall (weekly)."""
+        if not CHIRPS_AVAILABLE:
+            logger.debug("CHIRPS: not installed — skipping")
+            return
+
+        logger.info("CHIRPS: starting historical fetch...")
+        try:
+            fetcher = NASAChirpsFetcher()
+            await fetcher.fetch_and_process(days_back=7)
+            logger.info("CHIRPS: fetch complete")
+        except Exception as e:
+            logger.error(f"CHIRPS fetch failed: {e}")
+
     async def all_sources_status(self):
         """Log status of all satellite sources."""
         logger.info("=" * 60)
         logger.info("Satellite Data Fetcher Status:")
         logger.info(f"  NASA GPM IMERG:     {'ENABLED (real)' if self.has_nasa else 'SIMULATION MODE'}")
+        logger.info(f"  NASA CHIRPS:        {'ENABLED (real)' if self.has_nasa else 'SIMULATION MODE'}")
         logger.info(f"  Sentinel-1 SAR:     {'ENABLED (real)' if self.has_copernicus else 'NOT CONFIGURED'}")
         logger.info(f"  Sentinel-2 Optical: {'ENABLED (real)' if self.has_copernicus else 'NOT CONFIGURED'}")
         logger.info(f"  OSM Sync:           ALWAYS ENABLED (no auth required)")
@@ -138,6 +160,15 @@ class SatelliteFetcher:
             "interval",
             minutes=30,
             id="nasa_gpm",
+        )
+
+        # NASA CHIRPS: weekly
+        self.scheduler.add_job(
+            self.fetch_chirps,
+            "interval",
+            hours=168,
+            id="nasa_chirps",
+            next_run_time=datetime.now(timezone.utc) + timedelta(hours=12),
         )
 
         # Sentinel-1 SAR: check every hour
@@ -176,11 +207,13 @@ class SatelliteFetcher:
 
         self.scheduler.start()
         mode_nasa = "REAL DATA" if self.has_nasa else "SIMULATION"
+        mode_chirps = "REAL DATA" if self.has_nasa else "SIMULATION"
         mode_s1 = "REAL SEARCH" if self.has_copernicus else "NOT CONFIGURED"
         mode_s2 = "REAL SEARCH" if self.has_copernicus else "NOT CONFIGURED"
 
         logger.info("Satellite Data Fetcher started.")
         logger.info(f"  NASA GPM:    every 30 min  ({mode_nasa})")
+        logger.info(f"  NASA CHIRPS: weekly        ({mode_chirps})")
         logger.info(f"  Sentinel-1:  every 1 hr   ({mode_s1})")
         logger.info(f"  Sentinel-2:  every 6 hr   ({mode_s2})")
         logger.info(f"  OSM Sync:    daily 03:00 UTC")

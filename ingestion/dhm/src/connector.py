@@ -74,7 +74,7 @@ DHM_STATIONS = {
 # Nepal zones configuration
 with open(
     os.path.join(
-        os.path.dirname(__file__), "..", "shared", "config", "nepal_zones.json"
+        os.path.dirname(__file__), "..", "..", "..", "shared", "config", "nepal_zones.json"
     )
 ) as f:
     ZONES = json.load(f)["zones"]
@@ -362,6 +362,53 @@ class DHMConnector:
                         "source": "satellite_proxy",
                     },
                 )
+
+    async def backfill_simulation(self, days: int = 30):
+        """Simulate historical DHM data for the past N days."""
+        logger.info(f"Starting DHM backfill simulation for {days} days...")
+        
+        for day_offset in range(days):
+            timestamp = datetime.now(timezone.utc) - timedelta(days=day_offset)
+            for station_id in DHM_STATIONS:
+                data = self.client._simulate_rainfall(station_id)
+                # Override timestamp from simulation
+                data["timestamp"] = timestamp.isoformat()
+                
+                zones = self.mapper.map_station_to_zones(station_id)
+                for zone_id, dist_km in zones:
+                    self._write_to_influxdb_historical(station_id, zone_id, data, timestamp)
+        
+        logger.info("DHM backfill simulation complete.")
+
+    def _write_to_influxdb_historical(self, station_id: str, zone_id: str, data: dict, timestamp: datetime):
+        """Write DHM rainfall data to InfluxDB with specific timestamp."""
+        try:
+            from influxdb_client import InfluxDBClient, Point
+            from influxdb_client.client.write_api import SYNCHRONOUS
+
+            client = InfluxDBClient(
+                url=INFLUXDB_URL,
+                token=INFLUXDB_TOKEN,
+                org=INFLUXDB_ORG,
+            )
+            write_api = client.write_api(write_options=SYNCHRONOUS)
+
+            point = (
+                Point("dhm_rainfall")
+                .tag("station_id", station_id)
+                .tag("zone_id", zone_id)
+                .tag("source", "simulated_backfill")
+                .field("rainfall_1hr_mm", data.get("rainfall_1hr_mm", 0.0))
+                .field("rainfall_6hr_mm", data.get("rainfall_6hr_mm", 0.0))
+                .field("rainfall_24hr_mm", data.get("rainfall_24hr_mm", 0.0))
+                .field("rainfall_72hr_mm", data.get("rainfall_72hr_mm", 0.0))
+                .time(timestamp)
+            )
+
+            write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+            client.close()
+        except Exception as e:
+            logger.error(f"InfluxDB historical write failed for {station_id}: {e}")
 
     def start(self):
         """Start the APScheduler loop."""

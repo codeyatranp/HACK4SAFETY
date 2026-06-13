@@ -121,13 +121,30 @@ class Sentinel1Fetcher:
                     continue
 
                 # Simple bounding box check from footprint coordinates
-                coords = footprint.get("coordinates", [[]])
-                if not coords or not coords[0]:
+                coords = footprint.get("coordinates", [])
+                if not coords:
                     continue
 
-                flat_coords = coords[0]
-                lngs = [c[0] for c in flat_coords]
-                lats = [c[1] for c in flat_coords]
+                # Handle potential MultiPolygon nesting
+                if footprint.get("type") == "MultiPolygon":
+                    flat_coords = []
+                    for poly in coords:
+                        for ring in poly:
+                            flat_coords.extend(ring)
+                else:
+                    # Regular Polygon
+                    flat_coords = []
+                    for ring in coords:
+                        flat_coords.extend(ring)
+
+                if not flat_coords:
+                    continue
+
+                lngs = [c[0] for c in flat_coords if isinstance(c, (list, tuple)) and len(c) >= 2]
+                lats = [c[1] for c in flat_coords if isinstance(c, (list, tuple)) and len(c) >= 2]
+
+                if not lats or not lngs:
+                    continue
 
                 if min(lats) <= zlat <= max(lats) and min(lngs) <= zlng <= max(lngs):
                     coverage.append({
@@ -152,8 +169,12 @@ class Sentinel1Fetcher:
         try:
             import psycopg2
 
+            pg_host = os.getenv("POSTGRES_HOST", "localhost")
+            if pg_host == "postgres":
+                pg_host = "localhost"
+
             conn = psycopg2.connect(
-                host=os.getenv("POSTGRES_HOST", "localhost"),
+                host=pg_host,
                 port=int(os.getenv("POSTGRES_PORT", "5432")),
                 user=os.getenv("POSTGRES_USER", "geoguard"),
                 password=os.getenv("POSTGRES_PASSWORD", "geoguard_admin"),
@@ -203,8 +224,12 @@ class Sentinel1Fetcher:
         try:
             import psycopg2
 
+            pg_host = os.getenv("POSTGRES_HOST", "localhost")
+            if pg_host == "postgres":
+                pg_host = "localhost"
+
             conn = psycopg2.connect(
-                host=os.getenv("POSTGRES_HOST", "localhost"),
+                host=pg_host,
                 port=int(os.getenv("POSTGRES_PORT", "5432")),
                 user=os.getenv("POSTGRES_USER", "geoguard"),
                 password=os.getenv("POSTGRES_PASSWORD", "geoguard_admin"),
